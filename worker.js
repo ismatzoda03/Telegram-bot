@@ -1,189 +1,339 @@
 const TITLES = [
   {
-    name: "Проход защиты",
-    aliases: ["guard pass"],
+    id: "defense_pass",
+    title: "Проход защиты",
+    genres: "Экшен • Фэнтези",
+    description: "Манга «Проход защиты»"
   },
   {
-    name: "Я захватил власть в Академии одним лишь ножом для сашими",
-    aliases: [],
-  },
+    id: "sashimi_knife",
+    title: "Я захватил власть в Академии одним лишь ножом для сашими",
+    genres: "Экшен • Фэнтези • Академия",
+    description: "Манга об Академии"
+  }
 ];
-
-function normalize(value) {
-  return value.toLocaleLowerCase("ru").replace(/ё/g, "е").trim();
-}
-
-function findTitles(query) {
-  const normalizedQuery = normalize(query);
-
-  if (!normalizedQuery) return [];
-
-  return TITLES.filter((title) =>
-    [title.name, ...title.aliases].some((name) =>
-      normalize(name).includes(normalizedQuery) ||
-      normalizedQuery.includes(normalize(name))
-    )
-  );
-}
-
-function catalogText() {
-  return (
-    "📚 Тайтлы в каталоге:\n\n" +
-    TITLES.map((title, index) => `${index + 1}. ${title.name}`).join("\n") +
-    "\n\nНажми «🔎 Поиск» и напиши название или его часть."
-  );
-}
-
-async function handleUpdate(update, token) {
-  const message = update.message;
-
-  if (!message || !message.chat) return;
-
-  const chatId = message.chat.id;
-  const text = (message.text || "").trim();
-
-  if (text.startsWith("/start")) {
-    await sendMessage(
-      token,
-      chatId,
-      "👋 Добро пожаловать!\n\n" +
-        "Здесь можно искать тайтлы и находить ссылки на разрешённые источники. " +
-        "Бот пока не хранит и не пересылает главы.\n\n" +
-        "Выбери действие 👇",
-      {
-        keyboard: [
-          ["📚 Каталог", "🔎 Поиск"],
-          ["❤️ Подписки"],
-        ],
-        resize_keyboard: true,
-      }
-    );
-    return;
-  }
-
-  if (text === "📚 Каталог" || text === "/catalog") {
-    await sendMessage(token, chatId, catalogText());
-    return;
-  }
-
-  if (text === "🔎 Поиск" || text === "/search") {
-    await sendMessage(
-      token,
-      chatId,
-      "🔎 Напиши название тайтла целиком или его часть."
-    );
-    return;
-  }
-
-  if (text === "❤️ Подписки" || text === "/subscriptions") {
-    await sendMessage(
-      token,
-      chatId,
-      "❤️ Подписки и уведомления пока не подключены. Добавим их после настройки хранения данных."
-    );
-    return;
-  }
-
-  if (text === "/help") {
-    await sendMessage(
-      token,
-      chatId,
-      "ℹ️ Используй кнопки «📚 Каталог» и «🔎 Поиск». " +
-        "Сейчас бот показывает только названия тайтлов."
-    );
-    return;
-  }
-
-  if (message.document) {
-    await sendMessage(
-      token,
-      chatId,
-      "Приём PDF пока не включён. Сначала нужно подтвердить разрешение на размещение файлов и подготовить хранилище."
-    );
-    return;
-  }
-
-  if (!text) return;
-
-  const found = findTitles(text);
-
-  if (found.length > 0) {
-    await sendMessage(
-      token,
-      chatId,
-      "🔎 Нашёл:\n\n" +
-        found.map((title) => `📖 ${title.name}`).join("\n") +
-        "\n\nСсылку на разрешённый источник добавим после подтверждения сотрудничества."
-    );
-    return;
-  }
-
-  await sendMessage(
-    token,
-    chatId,
-    "Не нашёл такой тайтл.\n\n" + catalogText()
-  );
-}
-
-async function sendMessage(token, chatId, text, replyMarkup = null) {
-  const body = {
-    chat_id: chatId,
-    text,
-  };
-
-  if (replyMarkup) {
-    body.reply_markup = replyMarkup;
-  }
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!response.ok) {
-    console.error("Telegram sendMessage failed:", await response.text());
-  }
-}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (!env.BOT_TOKEN) {
-      return new Response("BOT_TOKEN не установлен", { status: 500 });
+    // Проверка, что Worker работает
+    if (url.pathname === "/") {
+      return new Response("SashiNote Bot работает ✅");
     }
 
-    if (request.method === "GET" && url.pathname === "/setup") {
+    // Установка Telegram webhook
+    if (url.pathname === "/setup") {
+      if (!env.BOT_TOKEN) {
+        return new Response("BOT_TOKEN не найден", {
+          status: 500
+        });
+      }
+
       const webhookUrl = `${url.origin}/telegram`;
 
-      const response = await fetch(
-        `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`,
+      const result = await telegramApi(
+        env.BOT_TOKEN,
+        "setWebhook",
         {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ url: webhookUrl }),
+          url: webhookUrl
         }
       );
 
-      return new Response(await response.text(), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify(
+          {
+            webhook: webhookUrl,
+            telegram: result
+          },
+          null,
+          2
+        ),
+        {
+          headers: {
+            "content-type": "application/json;charset=UTF-8"
+          }
+        }
+      );
     }
 
-    if (request.method === "POST" && url.pathname === "/telegram") {
-      const update = await request.json();
-      await handleUpdate(update, env.BOT_TOKEN);
-      return new Response("OK");
+    // Telegram отправляет обновления сюда
+    if (url.pathname === "/telegram") {
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", {
+          status: 405
+        });
+      }
+
+      try {
+        const update = await request.json();
+
+        await handleUpdate(update, env);
+
+        return new Response("OK");
+      } catch (error) {
+        console.error(error);
+
+        return new Response("OK");
+      }
     }
 
-    return new Response("Telegram bot работает ✅");
-  },
+    return new Response("Not Found", {
+      status: 404
+    });
+  }
 };
+
+
+async function handleUpdate(update, env) {
+  const token = env.BOT_TOKEN;
+
+  if (!token) {
+    throw new Error("BOT_TOKEN отсутствует");
+  }
+
+  // ============================
+  // ОБЫЧНЫЕ СООБЩЕНИЯ
+  // ============================
+
+  if (update.message) {
+    const message = update.message;
+    const chatId = message.chat.id;
+    const text = message.text?.trim() || "";
+
+    if (text === "/start") {
+      await showStart(token, chatId);
+      return;
+    }
+
+    if (text === "/catalog" || text === "📚 Каталог") {
+      await showCatalog(token, chatId);
+      return;
+    }
+
+    // Поиск по названию
+    if (text) {
+      const found = TITLES.filter(item =>
+        item.title
+          .toLowerCase()
+          .includes(text.toLowerCase())
+      );
+
+      if (found.length > 0) {
+        for (const item of found) {
+          await showTitle(token, chatId, item);
+        }
+
+        return;
+      }
+    }
+
+    await telegramApi(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "Я не понял сообщение.\n\n" +
+        "Нажми кнопку «📚 Каталог» или отправь /start.",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📚 Каталог",
+              callback_data: "catalog"
+            }
+          ]
+        ]
+      }
+    });
+
+    return;
+  }
+
+
+  // ============================
+  // НАЖАТИЯ НА КНОПКИ
+  // ============================
+
+  if (update.callback_query) {
+    const callback = update.callback_query;
+    const data = callback.data;
+    const chatId = callback.message?.chat?.id;
+
+    // Убирает загрузку на кнопке
+    await telegramApi(token, "answerCallbackQuery", {
+      callback_query_id: callback.id
+    });
+
+    if (!chatId) {
+      return;
+    }
+
+    if (data === "catalog") {
+      await showCatalog(token, chatId);
+      return;
+    }
+
+    if (data === "home") {
+      await showStart(token, chatId);
+      return;
+    }
+
+    if (data.startsWith("title:")) {
+      const id = data.substring(6);
+
+      const item = TITLES.find(x => x.id === id);
+
+      if (item) {
+        await showTitle(token, chatId, item);
+      }
+
+      return;
+    }
+
+    if (data.startsWith("chapters:")) {
+      const id = data.substring(9);
+
+      const item = TITLES.find(x => x.id === id);
+
+      if (!item) {
+        return;
+      }
+
+      await telegramApi(token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          `📖 ${item.title}\n\n` +
+          "Главы добавим следующим шагом.",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "⬅️ Назад к каталогу",
+                callback_data: "catalog"
+              }
+            ],
+            [
+              {
+                text: "🏠 Главное меню",
+                callback_data: "home"
+              }
+            ]
+          ]
+        }
+      });
+
+      return;
+    }
+  }
+}
+
+
+async function showStart(token, chatId) {
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+
+    text:
+      "👋 Добро пожаловать в SashiNote!\n\n" +
+      "📚 Здесь ты можешь выбрать мангу из каталога.\n\n" +
+      "Выбери действие:",
+
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "📚 Каталог",
+            callback_data: "catalog"
+          }
+        ]
+      ]
+    }
+  });
+}
+
+
+async function showCatalog(token, chatId) {
+  const buttons = TITLES.map(item => [
+    {
+      text: `📖 ${item.title}`,
+      callback_data: `title:${item.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "🏠 Главное меню",
+      callback_data: "home"
+    }
+  ]);
+
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+
+    text:
+      "📚 Каталог SashiNote\n\n" +
+      "Выбери произведение:",
+
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  });
+}
+
+
+async function showTitle(token, chatId, item) {
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+
+    text:
+      `📖 ${item.title}\n\n` +
+      `🎭 Жанры: ${item.genres}\n\n` +
+      `${item.description}`,
+
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "📚 Все главы",
+            callback_data: `chapters:${item.id}`
+          }
+        ],
+        [
+          {
+            text: "⬅️ Каталог",
+            callback_data: "catalog"
+          }
+        ]
+      ]
+    }
+  });
+}
+
+
+// ============================
+// TELEGRAM API
+// ============================
+
+async function telegramApi(token, method, data = {}) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/${method}`,
+    {
+      method: "POST",
+
+      headers: {
+        "content-type": "application/json"
+      },
+
+      body: JSON.stringify(data)
+    }
+  );
+
+  const result = await response.json();
+
+  if (!result.ok) {
+    console.error(
+      "Telegram API error:",
+      JSON.stringify(result)
+    );
+  }
+
+  return result;
+}
