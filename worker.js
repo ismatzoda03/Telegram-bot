@@ -184,7 +184,57 @@ async function handleUpdate(update, env) {
       await showCatalog(token, chatId);
       return;
     }
+if (data === "search") {
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🔍 Поиск манги\n\n" +
+      "Отправь мне название манги сообщением.\n\n" +
+      "Например:\n" +
+      "Проход защиты",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🏠 Главное меню",
+            callback_data: "home"
+          }
+        ]
+      ]
+    }
+  });
 
+  return;
+}
+
+if (data === "subscription") {
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🔔 Мои подписки\n\n" +
+      "Здесь будут находиться тайтлы, на которые ты подписан.\n\n" +
+      "Когда выйдет новая глава — бот сможет прислать уведомление.\n\n" +
+      "⚙️ Подписки подключим после добавления тайтлов.",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "📚 Каталог",
+            callback_data: "catalog"
+          }
+        ],
+        [
+          {
+            text: "🏠 Главное меню",
+            callback_data: "home"
+          }
+        ]
+      ]
+    }
+  });
+
+  return;
+}
     if (data === "home") {
       await showStart(token, chatId);
       return;
@@ -263,7 +313,39 @@ async function showStart(token, chatId) {
 }
 
 
-async function showCatalog(token, chatId) {
+async function showStart(token, chatId) {
+  await telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+
+    text:
+      "👋 Добро пожаловать в SashiNote!\n\n" +
+      "📚 Читай мангу\n" +
+      "🔍 Ищи нужный тайтл\n" +
+      "🔔 Подписывайся на обновления\n\n" +
+      "Выбери действие:",
+
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "📚 Каталог",
+            callback_data: "catalog"
+          }
+        ],
+        [
+          {
+            text: "🔍 Поиск",
+            callback_data: "search"
+          },
+          {
+            text: "🔔 Подписка",
+            callback_data: "subscription"
+          }
+        ]
+      ]
+    }
+  });
+}
   const buttons = TITLES.map(item => [
     {
       text: `📖 ${item.title}`,
