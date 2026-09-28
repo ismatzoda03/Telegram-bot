@@ -296,29 +296,6 @@ async function showStart(token, chatId) {
 
     text:
       "👋 Добро пожаловать в SashiNote!\n\n" +
-      "📚 Здесь ты можешь выбрать мангу из каталога.\n\n" +
-      "Выбери действие:",
-
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "📚 Каталог",
-            callback_data: "catalog"
-          }
-        ]
-      ]
-    }
-  });
-}
-
-
-async function showStart(token, chatId) {
-  await telegramApi(token, "sendMessage", {
-    chat_id: chatId,
-
-    text:
-      "👋 Добро пожаловать в SashiNote!\n\n" +
       "📚 Читай мангу\n" +
       "🔍 Ищи нужный тайтл\n" +
       "🔔 Подписывайся на обновления\n\n" +
