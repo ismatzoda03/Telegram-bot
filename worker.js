@@ -16,6 +16,19 @@ const TITLES = [
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/check") {
+  const me = await telegramApi(env.BOT_TOKEN, "getMe");
+  const webhook = await telegramApi(env.BOT_TOKEN, "getWebhookInfo");
+
+  return new Response(
+    JSON.stringify({ me, webhook }, null, 2),
+    {
+      headers: {
+        "content-type": "application/json;charset=UTF-8"
+      }
+    }
+  );
+    }
 
     // Проверка, что Worker работает
     if (url.pathname === "/") {
