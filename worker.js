@@ -1,4 +1,4 @@
-const TITLES = [;
+const TITLES = [];
 
 export default {
   async fetch(request, env) {
@@ -175,10 +175,8 @@ if (data === "search") {
   await telegramApi(token, "sendMessage", {
     chat_id: chatId,
     text:
-      "🔍 Поиск манги\n\n" +
-      "Отправь мне название манги сообщением.\n\n" +
-      "Например."
-      
+  "🔍 Поиск манги\n\n" +
+  "Отправь мне название манги сообщением.",
     reply_markup: {
       inline_keyboard: [
         [
