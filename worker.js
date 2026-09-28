@@ -1,17 +1,4 @@
-const TITLES = [
-  {
-    id: "defense_pass",
-    title: "Проход защиты",
-    genres: "Экшен • Фэнтези",
-    description: "Манга «Проход защиты»"
-  },
-  {
-    id: "sashimi_knife",
-    title: "Я захватил власть в Академии одним лишь ножом для сашими",
-    genres: "Экшен • Фэнтези • Академия",
-    description: "Манга об Академии"
-  }
-];
+const TITLES = [;
 
 export default {
   async fetch(request, env) {
@@ -190,8 +177,8 @@ if (data === "search") {
     text:
       "🔍 Поиск манги\n\n" +
       "Отправь мне название манги сообщением.\n\n" +
-      "Например:\n" +
-      "Проход защиты",
+      "Например."
+      
     reply_markup: {
       inline_keyboard: [
         [
