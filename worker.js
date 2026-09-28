@@ -345,7 +345,9 @@ async function showStart(token, chatId) {
       ]
     }
   });
-}
+}}
+
+async function showCatalog(token, chatId) {
   const buttons = TITLES.map(item => [
     {
       text: `📖 ${item.title}`,
@@ -371,7 +373,7 @@ async function showStart(token, chatId) {
       inline_keyboard: buttons
     }
   });
-}
+}}
 
 
 async function showTitle(token, chatId, item) {
