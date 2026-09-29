@@ -1,5 +1,12 @@
 {
-  "name": "sashinote-bot",
+  "name": "telegram-bot",
   "main": "worker.js",
-  "compatibility_date": "2026-09-28"
+  "compatibility_date": "2026-09-28",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sashinote-db",
+      "database_id": "acce0800-081a-4f95-b75c-701f67242f31"
+    }
+  ]
 }
