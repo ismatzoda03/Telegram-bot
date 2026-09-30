@@ -1,9 +1,9 @@
 // SashiNote: Cloudflare Worker + D1.
-// Bindings: BOT_TOKEN, ADMIN_ID, DB.
-// After deployment, open /setup once.
-
+// Bindings: BOT_TOKEN, ADMIN_ID, DB. Existing titles and files are preserved.
 const CHANNEL = "https://t.me/SashiNoteManga";
 const PAGE_SIZE = 9;
+const CARD_TTL = 30 * 60 * 1000;
+const PDF_COOLDOWN = 60 * 1000;
 const READY = new WeakMap();
 const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS sn_titles (id TEXT PRIMARY KEY, title_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, kind TEXT NOT NULL, genres TEXT NOT NULL, genre_key TEXT NOT NULL, source_label TEXT NOT NULL, source_url TEXT NOT NULL DEFAULT '', cover TEXT NOT NULL DEFAULT '')",
@@ -12,7 +12,12 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS sn_chapter_file ON sn_chapters(file_unique_id)",
   "CREATE TABLE IF NOT EXISTS sn_drafts (actor TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, step TEXT NOT NULL, data TEXT NOT NULL, last_update INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS sn_updates (id INTEGER PRIMARY KEY, status TEXT NOT NULL, lease INTEGER NOT NULL, created_at INTEGER NOT NULL)",
-  "CREATE TABLE IF NOT EXISTS sn_searches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, query TEXT NOT NULL, created_at INTEGER NOT NULL)"
+  "CREATE TABLE IF NOT EXISTS sn_searches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, query TEXT NOT NULL, created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS sn_reader_cards (id TEXT PRIMARY KEY, actor TEXT NOT NULL, chat TEXT NOT NULL, message_id INTEGER NOT NULL DEFAULT 0, title_id TEXT NOT NULL, has_photo INTEGER NOT NULL, last_activity INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS sn_reader_expiry ON sn_reader_cards(last_activity)",
+  "CREATE TABLE IF NOT EXISTS sn_read_marks (actor TEXT NOT NULL, chapter_id TEXT NOT NULL, read_at INTEGER NOT NULL, PRIMARY KEY(actor,chapter_id))",
+  "CREATE TABLE IF NOT EXISTS sn_pdf_limits (actor TEXT NOT NULL, chapter_id TEXT NOT NULL, sent_at INTEGER NOT NULL, update_id INTEGER NOT NULL, PRIMARY KEY(actor,chapter_id))",
+  "CREATE INDEX IF NOT EXISTS sn_pdf_expiry ON sn_pdf_limits(sent_at)"
 ];
 
 export default {
@@ -23,36 +28,25 @@ export default {
     try {
       if (url.pathname === "/setup") {
         await api(env, "setWebhook", {
-          url: url.origin + "/telegram",
-          secret_token: await webhookSecret(env.BOT_TOKEN),
-          allowed_updates: ["message", "callback_query"],
-          max_connections: 1
+          url: url.origin + "/telegram", secret_token: await webhookSecret(env.BOT_TOKEN),
+          allowed_updates: ["message", "callback_query"], max_connections: 1
         });
         return Response.json({ ok: true, message: "Бот подключён. Отправь ему /id." });
       }
       if (url.pathname === "/check") {
         const me = await api(env, "getMe");
         const webhook = await api(env, "getWebhookInfo");
-        return Response.json({
-          ok: true, bot: me.username, database_connected: !!env.DB,
-          admin_configured: !!adminId(env), webhook: webhook.url,
-          pending_updates: webhook.pending_update_count
-        });
+        return Response.json({ ok: true, bot: me.username, database_connected: !!env.DB,
+          admin_configured: !!adminId(env), webhook: webhook.url, pending_updates: webhook.pending_update_count });
       }
       if (url.pathname !== "/telegram") return new Response("Not Found", { status: 404 });
       if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
       const supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-      if (!sameSecret(supplied, await webhookSecret(env.BOT_TOKEN))) {
-        return new Response("Forbidden", { status: 403 });
-      }
+      if (!sameSecret(supplied, await webhookSecret(env.BOT_TOKEN))) return new Response("Forbidden", { status: 403 });
       let update;
-      try { update = await request.json(); }
-      catch { return new Response("Bad JSON", { status: 400 }); }
+      try { update = await request.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
       if (!Number.isSafeInteger(update.update_id)) return new Response("Bad update", { status: 400 });
-      if (!env.DB) {
-        await handleUpdate(update, env);
-        return new Response("OK");
-      }
+      if (!env.DB) { await handleUpdate(update, env); return new Response("OK"); }
       await initDatabase(env.DB);
       const now = Date.now();
       const claim = await run(env.DB,
@@ -60,9 +54,7 @@ export default {
         update.update_id, now + 120000, now, now);
       if (!claim.meta.changes) {
         const previous = await one(env.DB, "SELECT status FROM sn_updates WHERE id=?", update.update_id);
-        return new Response(previous?.status === "done" ? "OK" : "Retry", {
-          status: previous?.status === "done" ? 200 : 503
-        });
+        return new Response(previous?.status === "done" ? "OK" : "Retry", { status: previous?.status === "done" ? 200 : 503 });
       }
       try {
         await handleUpdate(update, env);
@@ -70,6 +62,8 @@ export default {
         if (update.update_id % 100 === 0) {
           await run(env.DB, "DELETE FROM sn_updates WHERE status='done' AND created_at < ?", now - 604800000);
           await run(env.DB, "DELETE FROM sn_searches WHERE created_at < ?", now - 86400000);
+          await run(env.DB, "DELETE FROM sn_reader_cards WHERE last_activity <= ?", now - CARD_TTL);
+          await run(env.DB, "DELETE FROM sn_pdf_limits WHERE sent_at < ?", now - 604800000);
         }
       } catch (error) {
         await run(env.DB, "UPDATE sn_updates SET lease=0 WHERE id=?", update.update_id);
@@ -86,17 +80,17 @@ export default {
 async function handleUpdate(update, env) {
   const message = update.message;
   const callback = update.callback_query;
-  if (callback) {
-    try { await api(env, "answerCallbackQuery", { callback_query_id: callback.id }); }
-    catch { /* A delayed callback may already have expired. */ }
-  }
   const chat = message?.chat || callback?.message?.chat;
   const actor = message?.from || callback?.from;
   if (!chat || !actor || actor.is_bot) return;
-  const c = {
-    env, db: env.DB, chat: chat.id, actor: String(actor.id),
-    uid: update.update_id, admin: chat.type === "private" && String(actor.id) === adminId(env)
-  };
+  const c = { env, db: env.DB, chat: chat.id, actor: String(actor.id), callback,
+    uid: update.update_id, admin: chat.type === "private" && String(actor.id) === adminId(env) };
+  try { return await routeUpdate(c, message, callback, chat); }
+  finally { await answer(c); }
+}
+
+async function routeUpdate(c, message, callback, chat) {
+  const env = c.env;
   const text = message?.text?.trim() || "";
   const command = text.split(/\s/)[0].split("@")[0];
   const data = callback?.data || "";
@@ -104,14 +98,13 @@ async function handleUpdate(update, env) {
     if (command === "/start") await say(c, "Открой бота в личных сообщениях.");
     return;
   }
-  if (command === "/id") {
-    await api(env, "sendMessage", {
-      chat_id: c.chat, text: "Твой Telegram ID:\n" + c.actor, protect_content: false
-    });
-    return;
-  }
+  if (command === "/id") return api(env, "sendMessage", { chat_id: c.chat, text: "Твой Telegram ID:\n" + c.actor, protect_content: false });
   if (command === "/start" || data === "home") return showHome(c);
   if (!env.DB) return say(c, "Каталог пока настраивается. Попробуй немного позже.");
+  if (data.startsWith("r:")) return readerCallback(c, data.split(":"));
+  // Cards sent by the previous version cannot bypass the new session timeout.
+  if (/^(title|chapters|chapter|pdf|read):/.test(data) &&
+      (!callback.message.date || Date.now() - callback.message.date * 1000 >= CARD_TTL)) return expired(c);
   if (data.startsWith("admin:")) return adminCallback(c, data.split(":"));
   if (["/admin", "/upload", "/cancel"].includes(command)) {
     if (!c.admin) return say(c, "Загружать главы может только владелец бота.");
@@ -123,32 +116,30 @@ async function handleUpdate(update, env) {
     if (draft && draft.step !== "done") return promptDraft(c, draft);
     return say(c, "Отправь PDF файлом или прямую HTTPS-ссылку на PDF.\nЯ помогу добавить тайтл и главу. Отмена: /cancel.");
   }
-  if (data === "search" || command === "/search" || text === "🔍 Поиск") {
-    return say(c, "Напиши название манги или жанр.", [[button("📚 Каталог", "catalog")]]);
-  }
-  if (data === "subscription") {
-    return say(c, "Новости SashiNote:", [[{ text: "🔔 Подписка", url: CHANNEL }]]);
-  }
+  if (data === "search" || command === "/search" || text === "🔍 Поиск") return say(c, "Напиши название манги или жанр.", [[button("📚 Каталог", "catalog")]]);
+  if (data === "subscription") return say(c, "Новости SashiNote:", [[{ text: "🔔 Подписка", url: CHANNEL }]]);
   if (data === "catalog" || command === "/catalog" || text === "📚 Каталог") return showCatalog(c);
   if (data.startsWith("catalog:")) return showCatalog(c, Number(data.split(":")[1]));
   if (data.startsWith("find:")) {
     const [, id, page] = data.split(":");
     const search = await one(c.db, "SELECT * FROM sn_searches WHERE id=? AND actor=?", id, c.actor);
-    if (!search || search.created_at < Date.now() - 86400000) {
-      return say(c, "Поиск устарел. Напиши название ещё раз.");
-    }
+    if (!search || search.created_at < Date.now() - 86400000) return say(c, "Поиск устарел. Напиши название ещё раз.");
     return showCatalog(c, Number(page), search);
   }
-  if (data.startsWith("title:")) return showTitle(c, data.split(":")[1]);
+  if (data.startsWith("title:")) return openReader(c, data.split(":")[1]);
   if (data.startsWith("chapters:")) {
     const [, id, page] = data.split(":");
-    return showChapters(c, id, Number(page || 0));
+    return openReader(c, id, Number(page || 0));
   }
-  if (data.startsWith("chapter:")) return showChapter(c, data.split(":")[1]);
-  if (data.startsWith("pdf:")) return sendPdf(c, data.split(":")[1]);
+  if (data.startsWith("chapter:") || data.startsWith("pdf:")) {
+    const ch = await getChapter(c, data.split(":")[1]);
+    if (!ch) return say(c, "Глава не найдена.");
+    return openReader(c, ch.title_id, 0, ch);
+  }
   if (data.startsWith("read:")) {
-    const chapter = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? ORDER BY volume,chapter_sort,id LIMIT 1", data.split(":")[1]);
-    return chapter ? sendPdf(c, chapter.id) : say(c, "Глав пока нет.");
+    const ch = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? ORDER BY volume,chapter_sort,id LIMIT 1", data.split(":")[1]);
+    if (!ch) return say(c, "Глав пока нет.");
+    return openReader(c, data.split(":")[1], 0, await getChapter(c, ch.id));
   }
   if (callback) return;
   const draft = c.admin ? await getDraft(c) : null;
@@ -163,18 +154,14 @@ async function handleUpdate(update, env) {
   if (text && !text.startsWith("/")) {
     if (text.length > 160) return say(c, "Напиши более короткое название или жанр.");
     const search = { id: randomId(), actor: c.actor, query: normalize(text), created_at: Date.now() };
-    await run(c.db, "INSERT INTO sn_searches(id,actor,query,created_at) VALUES(?,?,?,?)",
-      search.id, search.actor, search.query, search.created_at);
+    await run(c.db, "INSERT INTO sn_searches(id,actor,query,created_at) VALUES(?,?,?,?)", search.id, search.actor, search.query, search.created_at);
     return showCatalog(c, 0, search);
   }
   return say(c, "Выбери каталог или напиши название манги.", [[button("📚 Каталог", "catalog")]]);
 }
 
 async function showHome(c) {
-  const rows = [
-    [button("📚 Каталог", "catalog")],
-    [button("🔍 Поиск", "search"), { text: "🔔 Подписка", url: CHANNEL }]
-  ];
+  const rows = [[button("📚 Каталог", "catalog")], [button("🔍 Поиск", "search"), { text: "🔔 Подписка", url: CHANNEL }]];
   if (c.admin) rows.push([button("Добавить главу", "admin:new")]);
   return say(c, "👋 Добро пожаловать в SashiNote!\n\n📚 Читай мангу\n🔍 Находи нужный тайтл\n🔔 Следи за новостями\n\nВыбери действие:", rows);
 }
@@ -187,13 +174,9 @@ async function showCatalog(c, page = 0, search = null) {
   const pages = Math.max(1, Math.ceil(count.n / PAGE_SIZE));
   page = clampPage(page, pages);
   const items = await all(c.db, "SELECT * FROM sn_titles" + where + " ORDER BY title_key,id LIMIT ? OFFSET ?", ...args, PAGE_SIZE, page * PAGE_SIZE);
-  if (!items.length) {
-    return say(c, search ? "Ничего не найдено. Попробуй другое название или жанр." : "В каталоге пока нет тайтлов.",
-      [[button("🔍 Поиск", "search"), button("🏠 Главное меню", "home")]]);
-  }
+  if (!items.length) return say(c, search ? "Ничего не найдено. Попробуй другое название или жанр." : "В каталоге пока нет тайтлов.", [[button("🔍 Поиск", "search"), button("🏠 Главное меню", "home")]]);
   const heading = search ? "🔍 Результаты поиска" : "📚 Каталог SashiNote";
-  const text = heading + "\n\n" + items.map((item, i) => (i + 1) + ". " + item.title).join("\n")
-    + "\n\nСтраница " + (page + 1) + "/" + pages;
+  const text = heading + "\n\n" + items.map((item, i) => (i + 1) + ". " + item.title).join("\n") + "\n\nСтраница " + (page + 1) + "/" + pages;
   const rows = chunks(items.map((item, i) => button(String(i + 1), "title:" + item.id)), 3);
   const prefix = search ? "find:" + search.id + ":" : "catalog:";
   const navigation = [];
@@ -204,63 +187,128 @@ async function showCatalog(c, page = 0, search = null) {
   return say(c, text, rows);
 }
 
-async function showTitle(c, id) {
-  const title = await one(c.db, "SELECT * FROM sn_titles WHERE id=?", id);
-  if (!title) return say(c, "Тайтл не найден.", [[button("📚 Каталог", "catalog")]]);
-  return card(c, title, titleCaption(title), [
-    [button("📖 Читать", "read:" + id)],
-    [button("📚 Все главы", "chapters:" + id + ":0")],
-    [button("← Каталог", "catalog")]
-  ]);
-}
-
-async function showChapters(c, id, page = 0) {
-  const title = await one(c.db, "SELECT * FROM sn_titles WHERE id=?", id);
-  if (!title) return say(c, "Тайтл не найден.");
-  const count = await one(c.db, "SELECT COUNT(*) AS n FROM sn_chapters WHERE title_id=?", id);
-  const pages = Math.max(1, Math.ceil(count.n / PAGE_SIZE));
-  page = clampPage(page, pages);
-  const chapters = await all(c.db, "SELECT * FROM sn_chapters WHERE title_id=? ORDER BY volume,chapter_sort,id LIMIT ? OFFSET ?", id, PAGE_SIZE, page * PAGE_SIZE);
-  const rows = chunks(chapters.map(ch => button(ch.volume + "–" + ch.chapter, "chapter:" + ch.id)), 3);
-  const navigation = [];
-  if (page > 0) navigation.push(button("←", "chapters:" + id + ":" + (page - 1)));
-  if (page + 1 < pages) navigation.push(button("→", "chapters:" + id + ":" + (page + 1)));
-  if (navigation.length) rows.push(navigation);
-  rows.push([button("← К тайтлу", "title:" + id)]);
-  return say(c, title.title + "\n\nТом — глава\nСтраница " + (page + 1) + "/" + pages, rows);
-}
-
 async function getChapter(c, id) {
-  return one(c.db,
-    "SELECT ch.*,t.title,t.kind,t.genres,t.cover FROM sn_chapters ch JOIN sn_titles t ON t.id=ch.title_id WHERE ch.id=?", id);
+  return one(c.db, "SELECT ch.*,t.title,t.kind,t.genres,t.cover FROM sn_chapters ch JOIN sn_titles t ON t.id=ch.title_id WHERE ch.id=?", id);
 }
 
-async function showChapter(c, id) {
-  const chapter = await getChapter(c, id);
-  if (!chapter) return say(c, "Глава не найдена.");
-  return card(c, chapter, chapterCaption(chapter), [
-    [button("📖 Читать", "pdf:" + id)],
-    [button("📄 PDF", "pdf:" + id)],
-    [button("📚 Все главы", "chapters:" + chapter.title_id + ":0")]
-  ]);
+async function answer(c, text = "") {
+  if (!c.callback || c.answered) return;
+  c.answered = true;
+  try { await api(c.env, "answerCallbackQuery", { callback_query_id: c.callback.id, text, show_alert: false, cache_time: 0 }); }
+  catch { /* Telegram may have expired a delayed callback. */ }
+}
+function expired(c) { return answer(c, "Сообщение устарело. Откройте тайтл заново через /catalog."); }
+function readerButton(s, text, action, arg = "") { return button(text, "r:" + s.id + ":" + action + (arg === "" ? "" : ":" + arg)); }
+
+async function openReader(c, titleId, page = 0, chapter = null) {
+  const title = await one(c.db, "SELECT * FROM sn_titles WHERE id=?", titleId);
+  if (!title) return say(c, "Тайтл не найден.", [[button("📚 Каталог", "catalog")]]);
+  const s = { id: randomId(), title_id: titleId, message_id: 0, has_photo: title.cover ? 1 : 0 };
+  await run(c.db, "INSERT INTO sn_reader_cards(id,actor,chat,message_id,title_id,has_photo,last_activity) VALUES(?,?,?,0,?,?,?)",
+    s.id, c.actor, String(c.chat), titleId, s.has_photo, Date.now());
+  await renderReader(c, s, title, page, chapter);
+  if (chapter) return sendPdf(c, chapter);
 }
 
-async function sendPdf(c, id) {
-  const ch = await getChapter(c, id);
-  if (!ch) return say(c, "Глава не найдена.");
-  const prev = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? AND (volume < ? OR (volume=? AND chapter_sort < ?)) ORDER BY volume DESC,chapter_sort DESC LIMIT 1",
-    ch.title_id, ch.volume, ch.volume, ch.chapter_sort);
-  const next = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? AND (volume > ? OR (volume=? AND chapter_sort > ?)) ORDER BY volume,chapter_sort LIMIT 1",
-    ch.title_id, ch.volume, ch.volume, ch.chapter_sort);
-  const navigation = [];
-  if (prev) navigation.push(button("← Предыдущая", "pdf:" + prev.id));
-  if (next) navigation.push(button("Следующая →", "pdf:" + next.id));
-  const rows = navigation.length ? [navigation] : [];
-  rows.push([button("📚 Все главы", "chapters:" + ch.title_id + ":0")], [button("← К тайтлу", "title:" + ch.title_id)]);
-  return api(c.env, "sendDocument", {
-    chat_id: c.chat, document: ch.file_id, caption: chapterCaption(ch),
-    parse_mode: "HTML", reply_markup: { inline_keyboard: rows }
-  });
+async function readerCallback(c, [, id, action, arg]) {
+  const s = await one(c.db, "SELECT * FROM sn_reader_cards WHERE id=? AND actor=? AND chat=? AND message_id=?",
+    id, c.actor, String(c.chat), c.callback.message.message_id);
+  if (!s) return expired(c);
+  const now = Date.now();
+  const touched = await run(c.db, "UPDATE sn_reader_cards SET last_activity=? WHERE id=? AND last_activity>?", now, id, now - CARD_TTL);
+  if (!touched.meta.changes) return expired(c);
+  if (action === "exit") { await answer(c); return showCatalog(c); }
+  const title = await one(c.db, "SELECT * FROM sn_titles WHERE id=?", s.title_id);
+  if (!title) return answer(c, "Тайтл не найден.");
+  if (action === "list") { await answer(c); return renderReader(c, s, title, Number(arg || 0)); }
+  if (!["select", "pdf", "mark"].includes(action)) return answer(c, "Откройте список глав заново.");
+  const ch = await getChapter(c, arg);
+  if (!ch || ch.title_id !== s.title_id) return answer(c, "Глава не найдена.");
+  if (action === "mark") {
+    await run(c.db, "INSERT INTO sn_read_marks(actor,chapter_id,read_at) VALUES(?,?,?) ON CONFLICT(actor,chapter_id) DO NOTHING", c.actor, ch.id, now);
+    await answer(c, "Отмечено как прочитанное ✅");
+  }
+  // Edit only this original card. Downloaded documents never carry controls.
+  await renderReader(c, s, title, 0, ch);
+  if (action === "select" || action === "pdf") return sendPdf(c, ch);
+}
+
+async function renderReader(c, s, title, page = 0, ch = null) {
+  let caption = titleCaption(title);
+  let rows;
+  if (ch) {
+    const mark = await one(c.db, "SELECT chapter_id FROM sn_read_marks WHERE actor=? AND chapter_id=?", c.actor, ch.id);
+    const before = await one(c.db, "SELECT COUNT(*) AS n FROM sn_chapters WHERE title_id=? AND (volume<? OR (volume=? AND (chapter_sort<? OR (chapter_sort=? AND id<?))))",
+      ch.title_id, ch.volume, ch.volume, ch.chapter_sort, ch.chapter_sort, ch.id);
+    page = Math.floor(before.n / PAGE_SIZE);
+    const prev = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? AND (volume<? OR (volume=? AND (chapter_sort<? OR (chapter_sort=? AND id<?)))) ORDER BY volume DESC,chapter_sort DESC,id DESC LIMIT 1",
+      ch.title_id, ch.volume, ch.volume, ch.chapter_sort, ch.chapter_sort, ch.id);
+    const next = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? AND (volume>? OR (volume=? AND (chapter_sort>? OR (chapter_sort=? AND id>?)))) ORDER BY volume,chapter_sort,id LIMIT 1",
+      ch.title_id, ch.volume, ch.volume, ch.chapter_sort, ch.chapter_sort, ch.id);
+    caption = chapterCaption(ch);
+    rows = [[readerButton(s, "📄 PDF", "pdf", ch.id)], [readerButton(s, "Прочитано " + (mark ? "✅" : "❌"), "mark", ch.id)]];
+    const nav = [];
+    if (prev) nav.push(readerButton(s, "← Предыдущая", "select", prev.id));
+    if (next) nav.push(readerButton(s, "Следующая →", "select", next.id));
+    if (nav.length) rows.push(nav);
+    rows.push([readerButton(s, "📚 Все главы", "list", String(page))]);
+  } else {
+    const count = await one(c.db, "SELECT COUNT(*) AS n FROM sn_chapters WHERE title_id=?", title.id);
+    const pages = Math.max(1, Math.ceil(count.n / PAGE_SIZE));
+    page = clampPage(page, pages);
+    const chapters = await all(c.db, "SELECT ch.*,m.read_at FROM sn_chapters ch LEFT JOIN sn_read_marks m ON m.chapter_id=ch.id AND m.actor=? WHERE ch.title_id=? ORDER BY ch.volume,ch.chapter_sort,ch.id LIMIT ? OFFSET ?",
+      c.actor, title.id, PAGE_SIZE, page * PAGE_SIZE);
+    caption += count.n ? "\n\nТом — глава\nСтраница " + (page + 1) + "/" + pages : "\n\nГлав пока нет.";
+    rows = chunks(chapters.map(item => readerButton(s, item.volume + "–" + item.chapter + (item.read_at ? " ✅" : ""), "select", item.id)), 3);
+    const nav = [];
+    if (page > 0) nav.push(readerButton(s, "← Страница", "list", String(page - 1)));
+    if (page + 1 < pages) nav.push(readerButton(s, "Страница →", "list", String(page + 1)));
+    if (nav.length) rows.push(nav);
+    if (count.n) {
+      const first = await one(c.db, "SELECT id FROM sn_chapters WHERE title_id=? ORDER BY volume,chapter_sort,id LIMIT 1", title.id);
+      rows.push([readerButton(s, "📖 Читать с начала", "select", first.id)]);
+    }
+  }
+  rows.push([readerButton(s, "← Каталог", "exit")]);
+  if (!s.message_id) {
+    const sent = await card(c, title, caption, rows);
+    s.message_id = sent.message_id;
+    await run(c.db, "UPDATE sn_reader_cards SET message_id=? WHERE id=?", s.message_id, s.id);
+    return;
+  }
+  const payload = { chat_id: c.chat, message_id: s.message_id, parse_mode: "HTML", reply_markup: { inline_keyboard: rows } };
+  try {
+    if (s.has_photo) await api(c.env, "editMessageCaption", { ...payload, caption });
+    else await api(c.env, "editMessageText", { ...payload, text: caption, link_preview_options: { is_disabled: true } });
+  } catch (error) {
+    if (error.apiCode === 400 && /message is not modified/i.test(error.apiDescription || "")) return;
+    throw error;
+  }
+}
+
+async function sendPdf(c, ch) {
+  const now = Date.now();
+  // Atomic claim: another card, rapid double-clicks and retried updates share the same limit.
+  const claim = await run(c.db,
+    "INSERT INTO sn_pdf_limits(actor,chapter_id,sent_at,update_id) VALUES(?,?,?,?) ON CONFLICT(actor,chapter_id) DO UPDATE SET sent_at=excluded.sent_at,update_id=excluded.update_id WHERE sn_pdf_limits.sent_at<=? AND sn_pdf_limits.update_id<>excluded.update_id",
+    c.actor, ch.id, now, c.uid, now - PDF_COOLDOWN);
+  if (!claim.meta.changes) {
+    const previous = await one(c.db, "SELECT sent_at FROM sn_pdf_limits WHERE actor=? AND chapter_id=?", c.actor, ch.id);
+    const seconds = Math.max(1, Math.ceil(((previous?.sent_at || now) + PDF_COOLDOWN - now) / 1000));
+    return answer(c, "PDF уже отправлен. Повторить можно через " + seconds + " сек.");
+  }
+  await answer(c);
+  try {
+    return await api(c.env, "sendDocument", { chat_id: c.chat, document: ch.file_id,
+      caption: chapterCaption(ch), parse_mode: "HTML", protect_content: false });
+  } catch (error) {
+    // An explicit API rejection means no document was sent; a timeout is ambiguous.
+    if (error.apiCode >= 400 && error.apiCode < 500) {
+      await run(c.db, "DELETE FROM sn_pdf_limits WHERE actor=? AND chapter_id=? AND update_id=?", c.actor, ch.id, c.uid);
+      return say(c, "Не удалось отправить PDF. Попробуйте нажать «PDF» немного позже.");
+    }
+    return say(c, "Не удалось подтвердить отправку PDF. Проверьте сообщения ниже и, если файла нет, повторите через минуту.");
+  }
 }
 
 async function beginUpload(c, message) {
@@ -508,6 +556,7 @@ async function api(env, method, data = {}) {
   if (!response.ok || !result.ok) {
     const error = new Error("Telegram request failed");
     error.apiMethod = method; error.apiCode = result.error_code || response.status;
+    error.apiDescription = result.description || "";
     throw error;
   }
   return result.result;
